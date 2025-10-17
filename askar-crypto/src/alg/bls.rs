@@ -358,9 +358,9 @@ impl BlsPublicKeyType for G1 {
 
     fn from_public_bytes(key: &[u8]) -> Result<Self::Buffer, Error> {
         let res = if let Ok(buf) = key.try_into() {
-            G1Affine::from_compressed(buf).into_option()
+            G1Affine::from_compressed(buf).into()
         } else if let Ok(buf) = key.try_into() {
-            G1Affine::from_uncompressed(buf).into_option()
+            G1Affine::from_uncompressed(buf).into()
         } else {
             None
         };
@@ -400,9 +400,9 @@ impl BlsPublicKeyType for G2 {
 
     fn from_public_bytes(key: &[u8]) -> Result<Self::Buffer, Error> {
         let res = if let Ok(buf) = key.try_into() {
-            G2Affine::from_compressed(buf).into_option()
+            G2Affine::from_compressed(buf).into()
         } else if let Ok(buf) = key.try_into() {
-            G2Affine::from_uncompressed(buf).into_option()
+            G2Affine::from_uncompressed(buf).into()
         } else {
             None
         };

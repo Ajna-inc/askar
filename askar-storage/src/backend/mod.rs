@@ -22,6 +22,11 @@ pub mod postgres;
 /// Sqlite database support
 pub mod sqlite;
 
+#[cfg(feature = "flatfile")]
+#[cfg_attr(docsrs, doc(cfg(feature = "flatfile")))]
+/// Flat file-based storage support (lightweight, no database dependencies)
+pub mod flatfile;
+
 /// Enum to support custom ordering in record queries
 #[derive(Debug, Default)]
 pub enum OrderBy {

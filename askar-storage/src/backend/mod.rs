@@ -16,6 +16,9 @@ pub(crate) mod db_utils;
 
 pub mod freshness;
 
+pub mod journal;
+use journal::{Export, JournalChanges, JournalHead};
+
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 mod db_recovery;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
@@ -100,6 +103,49 @@ pub trait Backend: Debug + Send + Sync {
 
     /// Close the store instance
     fn close(&self) -> BoxFuture<'_, Result<(), Error>>;
+
+    /// Start recording every change to the store's entries, so that
+    /// [`Backend::journal_changes`] can say what changed since a point. Idempotent.
+    fn enable_journal(&self) -> BoxFuture<'_, Result<JournalHead, Error>> {
+        unsupported("journal")
+    }
+
+    /// The journal's current head, `None` if the store keeps no journal.
+    fn journal_head(&self) -> BoxFuture<'_, Result<Option<JournalHead>, Error>> {
+        unsupported("journal")
+    }
+
+    /// The changes recorded after sequence number `after`, at most `limit` journal rows' worth,
+    /// one per item, each with the item's current content or its removal.
+    fn journal_changes(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<JournalChanges, Error>> {
+        let _ = (after, limit);
+        unsupported("journal")
+    }
+
+    /// Drop journal rows up to and including `through`, once they are safely elsewhere.
+    /// Returns how many were dropped.
+    fn journal_prune(&self, through: u64) -> BoxFuture<'_, Result<u64, Error>> {
+        let _ = through;
+        unsupported("journal")
+    }
+
+    /// Every profile and unexpired entry of the store, read at one point, with the journal
+    /// head at that point.
+    fn export(&self) -> BoxFuture<'_, Result<Export, Error>> {
+        unsupported("export")
+    }
+}
+
+fn unsupported<T: Send + 'static>(what: &'static str) -> BoxFuture<'static, Result<T, Error>> {
+    Box::pin(std::future::ready(Err(err_msg!(
+        Unsupported,
+        "This backend does not support {}",
+        what
+    ))))
 }
 
 /// Create, open, or remove a generic backend implementation

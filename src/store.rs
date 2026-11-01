@@ -1,4 +1,8 @@
-use askar_storage::backend::{copy_profile, OrderBy};
+use askar_storage::backend::{
+    copy_profile,
+    journal::{self, Export, JournalChanges, JournalHead},
+    OrderBy,
+};
 
 use crate::{
     error::Error,
@@ -109,6 +113,41 @@ impl Store {
     ) -> Result<(), Error> {
         copy_profile(&self.0, &target.0, from_name, to_name).await?;
         Ok(())
+    }
+
+    /// Start recording every change to the store's entries (idempotent)
+    pub async fn enable_journal(&self) -> Result<JournalHead, Error> {
+        Ok(self.0.enable_journal().await?)
+    }
+
+    /// The journal's current head, `None` if the store keeps no journal
+    pub async fn journal_head(&self) -> Result<Option<JournalHead>, Error> {
+        Ok(self.0.journal_head().await?)
+    }
+
+    /// The changes recorded after sequence number `after`, one per item
+    pub async fn journal_changes(&self, after: u64, limit: usize) -> Result<JournalChanges, Error> {
+        Ok(self.0.journal_changes(after, limit).await?)
+    }
+
+    /// Drop journal rows up to and including `through`
+    pub async fn journal_prune(&self, through: u64) -> Result<u64, Error> {
+        Ok(self.0.journal_prune(through).await?)
+    }
+
+    /// Every profile and unexpired entry, read at one point, with the journal head
+    pub async fn export(&self) -> Result<Export, Error> {
+        Ok(self.0.export().await?)
+    }
+
+    /// Write an export into this (empty) store
+    pub async fn import(&self, export: &Export) -> Result<(), Error> {
+        Ok(journal::import(&self.0, export).await?)
+    }
+
+    /// Apply journal changes, in order, to a store restored from an earlier export
+    pub async fn apply_changes(&self, changes: &JournalChanges) -> Result<(), Error> {
+        Ok(journal::apply_changes(&self.0, changes).await?)
     }
 
     /// Create a new profile with the given profile name

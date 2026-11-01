@@ -32,6 +32,7 @@ use crate::{
     protect::{EntryEncryptor, KeyCache, PassKey, ProfileId, ProfileKey, StoreKeyMethod},
 };
 
+mod journal;
 mod provision;
 pub use provision::SqliteStoreOptions;
 
@@ -411,6 +412,30 @@ impl Backend for SqliteBackend {
             self.conn_pool.close().await;
             Ok(())
         })
+    }
+
+    fn enable_journal(&self) -> BoxFuture<'_, Result<super::journal::JournalHead, Error>> {
+        Box::pin(self.journal_enable())
+    }
+
+    fn journal_head(&self) -> BoxFuture<'_, Result<Option<super::journal::JournalHead>, Error>> {
+        Box::pin(self.journal_head_read())
+    }
+
+    fn journal_changes(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<super::journal::JournalChanges, Error>> {
+        Box::pin(self.journal_changes_read(after, limit))
+    }
+
+    fn journal_prune(&self, through: u64) -> BoxFuture<'_, Result<u64, Error>> {
+        Box::pin(self.journal_prune_rows(through))
+    }
+
+    fn export(&self) -> BoxFuture<'_, Result<super::journal::Export, Error>> {
+        Box::pin(self.export_all())
     }
 }
 

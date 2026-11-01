@@ -4,7 +4,10 @@ use std::{fmt::Debug, sync::Arc};
 
 use super::{Backend, BackendSession, ManageBackend};
 use crate::{
-    backend::OrderBy,
+    backend::{
+        journal::{Export, JournalChanges, JournalHead},
+        OrderBy,
+    },
     entry::{Entry, EntryKind, EntryOperation, EntryTag, Scan, TagFilter},
     error::Error,
     future::BoxFuture,
@@ -110,6 +113,35 @@ impl<B: Backend> Backend for WrapBackend<B> {
     fn close(&self) -> BoxFuture<'_, Result<(), Error>> {
         self.0.close()
     }
+
+    #[inline]
+    fn enable_journal(&self) -> BoxFuture<'_, Result<JournalHead, Error>> {
+        self.0.enable_journal()
+    }
+
+    #[inline]
+    fn journal_head(&self) -> BoxFuture<'_, Result<Option<JournalHead>, Error>> {
+        self.0.journal_head()
+    }
+
+    #[inline]
+    fn journal_changes(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<JournalChanges, Error>> {
+        self.0.journal_changes(after, limit)
+    }
+
+    #[inline]
+    fn journal_prune(&self, through: u64) -> BoxFuture<'_, Result<u64, Error>> {
+        self.0.journal_prune(through)
+    }
+
+    #[inline]
+    fn export(&self) -> BoxFuture<'_, Result<Export, Error>> {
+        self.0.export()
+    }
 }
 
 // Forward to the concrete inner backend instance
@@ -196,6 +228,35 @@ impl Backend for AnyBackend {
     #[inline]
     fn close(&self) -> BoxFuture<'_, Result<(), Error>> {
         self.0.close()
+    }
+
+    #[inline]
+    fn enable_journal(&self) -> BoxFuture<'_, Result<JournalHead, Error>> {
+        self.0.enable_journal()
+    }
+
+    #[inline]
+    fn journal_head(&self) -> BoxFuture<'_, Result<Option<JournalHead>, Error>> {
+        self.0.journal_head()
+    }
+
+    #[inline]
+    fn journal_changes(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<JournalChanges, Error>> {
+        self.0.journal_changes(after, limit)
+    }
+
+    #[inline]
+    fn journal_prune(&self, through: u64) -> BoxFuture<'_, Result<u64, Error>> {
+        self.0.journal_prune(through)
+    }
+
+    #[inline]
+    fn export(&self) -> BoxFuture<'_, Result<Export, Error>> {
+        self.0.export()
     }
 }
 

@@ -520,7 +520,7 @@ pub async fn db_scan(db: AnyBackend) {
 }
 
 pub async fn db_remove_all(db: AnyBackend) {
-    let test_rows = vec![
+    let test_rows = [
         Entry::new(
             EntryKind::Item,
             "category",
@@ -780,15 +780,32 @@ pub async fn db_txn_contention(db: AnyBackend) {
     async fn inc(db: AnyBackend, category: String, name: String) -> Result<(), &'static str> {
         // try to avoid panics in this section, as they will be raised on a tokio worker thread
         for _ in 0..INC {
-            let mut conn = db.session(None, true).expect(ERR_TRANSACTION);
-            let row = conn
-                .fetch(EntryKind::Item, &category, &name, true)
-                .await
-                .map_err(|e| {
-                    log::error!("{:?}", e);
-                    ERR_FETCH
-                })?
-                .ok_or(ERR_REQ_ROW)?;
+            // A busy SQLite writer reservation is a valid admission failure.
+            // Under load, ten workers doing 10,000 total transactions can starve
+            // one reservation beyond SQLite's five-second busy timeout. Retry
+            // only before reading/mutating the counter; all 10,000 committed
+            // increments and every non-contention error remain asserted.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let (mut conn, row) = loop {
+                let mut conn = db.session(None, true).expect(ERR_TRANSACTION);
+                match conn.fetch(EntryKind::Item, &category, &name, true).await {
+                    Ok(Some(row)) => break (conn, row),
+                    Ok(None) => return Err(ERR_REQ_ROW),
+                    Err(error)
+                        if format!("{error:?}").contains("database is locked")
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        conn.close(false)
+                            .await
+                            .map_err(|_| "Error closing failed admission")?;
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(error) => {
+                        log::error!("{error:?}");
+                        return Err(ERR_FETCH);
+                    }
+                }
+            };
             let val: usize = str::parse(row.value.as_opt_str().ok_or("Non-string counter value")?)
                 .map_err(|_| "Error parsing counter value")?;
             conn.update(

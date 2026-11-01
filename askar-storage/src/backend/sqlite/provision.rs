@@ -5,8 +5,8 @@ use std::{
 
 use sqlx::{
     sqlite::{
-        SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqliteLockingMode, SqlitePool,
-        SqlitePoolOptions, SqliteSynchronous,
+        SqliteConnectOptions, SqliteJournalMode, SqliteLockingMode, SqlitePool, SqlitePoolOptions,
+        SqliteSynchronous,
     },
     ConnectOptions, Error as SqlxError, Row,
 };
@@ -34,6 +34,8 @@ const DEFAULT_SYNCHRONOUS: SqliteSynchronous = SqliteSynchronous::Full;
 /// Configuration options for Sqlite stores
 #[derive(Debug)]
 pub struct SqliteStoreOptions {
+    pub(crate) expected_freshness: Option<uuid::Uuid>,
+    pub(crate) read_lease: Option<Duration>,
     pub(crate) in_memory: bool,
     pub(crate) path: String,
     pub(crate) busy_timeout: Duration,
@@ -52,9 +54,63 @@ impl Default for SqliteStoreOptions {
 }
 
 impl SqliteStoreOptions {
+    /// `freshness_read_lease_ms` in the URI sets the read lease of this store's pinned
+    /// lineage for the process (see `freshness::default_read_lease`).
+    fn apply_read_lease(&self) -> Result<(), Error> {
+        if let Some(lease) = self.read_lease {
+            let lineage = match self.expected_freshness {
+                Some(lineage) => Some(lineage),
+                None => super::super::freshness::expected_lineage()?,
+            };
+            if let Some(lineage) = lineage {
+                super::super::freshness::set_read_lease(lineage, Some(lease));
+            }
+        }
+        Ok(())
+    }
+
+    async fn refuse_bound_destructive(&self) -> Result<(), Error> {
+        if self
+            .expected_freshness
+            .or(super::super::freshness::expected_lineage()?)
+            .is_some()
+        {
+            return Err(err_msg!(
+                Backend,
+                "Bound deployment refuses destructive store operations"
+            ));
+        }
+        if self.in_memory || !std::path::Path::new(&self.path).exists() {
+            return Ok(());
+        }
+        let pool = self.pool(false).await?;
+        let mut conn = pool.acquire().await?;
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='config'",
+        )
+        .fetch_one(conn.as_mut())
+        .await?;
+        if exists > 0
+            && <sqlx::Sqlite as super::ExtDatabase>::freshness_head(&mut conn, false)
+                .await?
+                .is_some()
+        {
+            return Err(err_msg!(
+                Backend,
+                "Bound store refuses destructive operations"
+            ));
+        }
+        Ok(())
+    }
+
     /// Initialize `SqliteStoreOptions` from a generic set of options
     pub fn new<'a>(options: impl IntoOptions<'a>) -> Result<Self, Error> {
         let mut opts = options.into_options()?;
+        let expected_freshness =
+            super::super::freshness::parse_lineage(opts.query.remove("freshness_lineage"))?;
+        let read_lease = super::super::freshness::parse_read_lease(
+            opts.query.remove("freshness_read_lease_ms"),
+        )?;
         let mut path = opts.host.to_string();
         path.push_str(&opts.path);
         let in_memory = path == ":memory:";
@@ -117,6 +173,8 @@ impl SqliteStoreOptions {
         };
 
         Ok(Self {
+            expected_freshness,
+            read_lease,
             in_memory,
             path,
             busy_timeout,
@@ -133,9 +191,13 @@ impl SqliteStoreOptions {
         #[allow(unused_mut)]
         let mut conn_opts = SqliteConnectOptions::from_str(self.path.as_ref())?
             .create_if_missing(auto_create)
-            .auto_vacuum(SqliteAutoVacuum::Incremental)
             .busy_timeout(self.busy_timeout)
-            .journal_mode(self.journal_mode)
+            // No `auto_vacuum` or `journal_mode` here: both are properties of the database file
+            // (`provision` sets them once, on creation), and these options run on EVERY new
+            // pooled connection. `PRAGMA auto_vacuum` takes the write lock even when the value is
+            // unchanged, so a connection opened while another writer held the database waited
+            // out `busy_timeout` and failed ("database is locked"): tenant transactions rolled
+            // back, inbound custody failed, authenticated requests answered 401.
             .locking_mode(self.locking_mode)
             .shared_cache(self.shared_cache)
             .synchronous(self.synchronous);
@@ -164,6 +226,19 @@ impl SqliteStoreOptions {
         profile: Option<String>,
         recreate: bool,
     ) -> Result<SqliteBackend, Error> {
+        if self
+            .expected_freshness
+            .or(super::super::freshness::expected_lineage()?)
+            .is_some()
+        {
+            return Err(err_msg!(
+                Backend,
+                "Bound deployment refuses implicit provisioning"
+            ));
+        }
+        if recreate {
+            self.refuse_bound_destructive().await?;
+        }
         if recreate && !self.in_memory {
             try_remove_file(self.path.to_string()).await?;
         }
@@ -185,15 +260,37 @@ impl SqliteStoreOptions {
             if found {
                 return open_db(
                     conn_pool,
+                    self.busy_timeout,
                     Some(method),
                     pass_key,
                     profile,
                     self.path.to_string(),
+                    self.expected_freshness,
                 )
                 .await;
             }
         }
         // else: no 'config' table, assume empty database
+
+        // File properties, set once on creation: `auto_vacuum` before the first table (it only
+        // takes effect then), then the journal mode.
+        {
+            let mut conn = conn_pool.acquire().await?;
+            sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
+                .execute(conn.as_mut())
+                .await
+                .map_err(err_map!(Backend, "Error setting auto_vacuum"))?;
+            if !self.in_memory {
+                sqlx::query(&format!(
+                    "PRAGMA journal_mode = {}",
+                    journal_mode_sql(self.journal_mode)
+                ))
+                .execute(conn.as_mut())
+                .await
+                .map_err(err_map!(Backend, "Error setting the journal mode"))?;
+            }
+            conn.return_to_pool().await;
+        }
 
         let default_profile = profile.unwrap_or_else(random_profile_name);
         let key_cache = init_db(&conn_pool, &default_profile, method, pass_key).await?;
@@ -203,7 +300,9 @@ impl SqliteStoreOptions {
             default_profile,
             key_cache,
             self.path.to_string(),
-        ))
+            self.busy_timeout,
+        )
+        .with_freshness_lineage(self.expected_freshness))
     }
 
     /// Open an existing Sqlite store from this set of configuration options
@@ -213,6 +312,7 @@ impl SqliteStoreOptions {
         pass_key: PassKey<'_>,
         profile: Option<String>,
     ) -> Result<SqliteBackend, Error> {
+        self.apply_read_lease()?;
         let conn_pool = match self.pool(false).await {
             Ok(pool) => Ok(pool),
             Err(SqlxError::Database(db_err)) => {
@@ -229,11 +329,21 @@ impl SqliteStoreOptions {
             }
             Err(err) => Err(err.into()),
         }?;
-        open_db(conn_pool, method, pass_key, profile, self.path.to_string()).await
+        open_db(
+            conn_pool,
+            self.busy_timeout,
+            method,
+            pass_key,
+            profile,
+            self.path.to_string(),
+            self.expected_freshness,
+        )
+        .await
     }
 
     /// Remove the Sqlite store defined by these configuration options
     pub async fn remove(self) -> Result<bool, Error> {
+        self.refuse_bound_destructive().await?;
         if self.in_memory {
             Ok(true)
         } else {
@@ -376,12 +486,26 @@ async fn init_db(
 
 async fn open_db(
     conn_pool: SqlitePool,
+    busy_timeout: Duration,
     method: Option<StoreKeyMethod>,
     pass_key: PassKey<'_>,
     profile: Option<String>,
     path: String,
+    expected_freshness: Option<uuid::Uuid>,
 ) -> Result<SqliteBackend, Error> {
     let mut conn = conn_pool.acquire().await?;
+    // Opening never relies on a read lease: the witness is asked now. A head one behind the
+    // witness at open is another process's commit in flight or a stale clone; re-admission
+    // within the read budget settles which (see `ReadRetry`).
+    let mut retry = super::super::freshness::ReadRetry::new(false);
+    loop {
+        let head = <sqlx::Sqlite as super::ExtDatabase>::freshness_head(&mut conn, false).await?;
+        match super::super::freshness::check_fresh(head.as_ref(), expected_freshness).await {
+            Ok(()) => break,
+            Err(error) if retry.again(&error).await => continue,
+            Err(error) => return Err(error),
+        }
+    }
     let mut ver_ok = false;
     let mut default_profile: Option<String> = None;
     let mut store_key_ref: Option<String> = None;
@@ -442,7 +566,10 @@ async fn open_db(
     conn.return_to_pool().await;
     key_cache.add_profile_mut(profile.clone(), profile_id, profile_key);
 
-    Ok(SqliteBackend::new(conn_pool, profile, key_cache, path))
+    Ok(
+        SqliteBackend::new(conn_pool, profile, key_cache, path, busy_timeout)
+            .with_freshness_lineage(expected_freshness),
+    )
 }
 
 async fn try_remove_file(path: String) -> Result<bool, Error> {
@@ -468,5 +595,16 @@ async fn try_remove_file(path: String) -> Result<bool, Error> {
                 return Err(err_msg!(Backend, "Error removing file: still in use"));
             }
         }
+    }
+}
+
+fn journal_mode_sql(mode: SqliteJournalMode) -> &'static str {
+    match mode {
+        SqliteJournalMode::Delete => "DELETE",
+        SqliteJournalMode::Truncate => "TRUNCATE",
+        SqliteJournalMode::Persist => "PERSIST",
+        SqliteJournalMode::Memory => "MEMORY",
+        SqliteJournalMode::Wal => "WAL",
+        SqliteJournalMode::Off => "OFF",
     }
 }

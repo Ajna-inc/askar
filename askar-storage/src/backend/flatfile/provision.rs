@@ -32,6 +32,12 @@ impl FlatFileStoreOptions {
 
     /// Convert a path string to store options
     pub fn from_str(path: &str) -> Result<Self, Error> {
+        if path.contains("freshness_lineage=") {
+            return Err(err_msg!(
+                Unsupported,
+                "Flat-file freshness binding unsupported"
+            ));
+        }
         Ok(Self::new(path))
     }
 }
@@ -46,6 +52,7 @@ impl<'a> ManageBackend<'a> for FlatFileStoreOptions {
         profile: Option<String>,
     ) -> BoxFuture<'a, Result<Self::Backend, Error>> {
         Box::pin(async move {
+            super::refuse_freshness_deployment()?;
             if !self.path.exists() {
                 return Err(err_msg!(NotFound, "Store directory not found"));
             }
@@ -121,6 +128,7 @@ impl<'a> ManageBackend<'a> for FlatFileStoreOptions {
         recreate: bool,
     ) -> BoxFuture<'a, Result<Self::Backend, Error>> {
         Box::pin(async move {
+            super::refuse_freshness_deployment()?;
             // Check if store already exists
             if self.path.exists() {
                 if recreate {
@@ -144,14 +152,23 @@ impl<'a> ManageBackend<'a> for FlatFileStoreOptions {
                 let pass_key = pass_key.into_owned();
                 move || -> Result<(StoreKey, String, ProfileKey, Vec<u8>), Error> {
                     if method == StoreKeyMethod::RawKey && pass_key.is_empty() {
-                        return Err(err_msg!(Input, "Cannot create a store with a blank raw key"));
+                        return Err(err_msg!(
+                            Input,
+                            "Cannot create a store with a blank raw key"
+                        ));
                     }
                     let (store_key, store_key_ref) = method.resolve(pass_key)?;
                     let profile_key = ProfileKey::new()?;
                     let enc_profile_key = store_key.wrap_data(profile_key.to_bytes()?)?;
-                    Ok((store_key, store_key_ref.into_uri(), profile_key, enc_profile_key))
+                    Ok((
+                        store_key,
+                        store_key_ref.into_uri(),
+                        profile_key,
+                        enc_profile_key,
+                    ))
                 }
-            }).await?;
+            })
+            .await?;
 
             // Write store key reference
             let store_key_path = self.path.join(STORE_KEY_FILE);
@@ -209,6 +226,7 @@ impl<'a> ManageBackend<'a> for FlatFileStoreOptions {
 
     fn remove_backend(self) -> BoxFuture<'a, Result<bool, Error>> {
         Box::pin(async move {
+            super::refuse_freshness_deployment()?;
             if !self.path.exists() {
                 return Ok(false);
             }

@@ -105,7 +105,10 @@ impl Options<'_> {
         uri.push_str(&self.path);
         if !self.query.is_empty() {
             uri.push('?');
-            for (k, v) in self.query {
+            for (index, (k, v)) in self.query.into_iter().enumerate() {
+                if index > 0 {
+                    uri.push('&');
+                }
                 push_iter_str(&mut uri, url::form_urlencoded::byte_serialize(k.as_bytes()));
                 uri.push('=');
                 push_iter_str(&mut uri, url::form_urlencoded::byte_serialize(v.as_bytes()));
@@ -198,5 +201,18 @@ mod tests {
         let opts_str = "schema://user%2F:pass@dbname?a+1=b#frag%2E";
         let opts = Options::parse_uri(opts_str).unwrap();
         assert_eq!(opts.into_uri(), opts_str);
+    }
+
+    #[test]
+    fn multiple_connection_options_remain_separate_and_encoded() {
+        let original = Options::parse_uri(
+            "postgres://user:pass@host/db?sslmode=require&options=-csearch_path%3Dauthority&application_name=a%26b",
+        ).unwrap();
+        let encoded = original.clone().into_uri();
+        let reparsed = Options::parse_uri(&encoded).unwrap();
+        assert_eq!(reparsed, original);
+        assert_eq!(reparsed.query["sslmode"], "require");
+        assert_eq!(reparsed.query["options"], "-csearch_path=authority");
+        assert_eq!(reparsed.query["application_name"], "a&b");
     }
 }

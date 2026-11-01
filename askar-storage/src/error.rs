@@ -63,6 +63,7 @@ pub struct Error {
     pub(crate) kind: ErrorKind,
     pub(crate) cause: Option<Box<dyn StdError + Send + Sync + 'static>>,
     pub(crate) message: Option<String>,
+    pub(crate) read_head_moved: bool,
 }
 
 impl Error {
@@ -70,6 +71,7 @@ impl Error {
         Self {
             kind,
             cause: None,
+            read_head_moved: false,
             message: Some(msg.into()),
         }
     }
@@ -137,6 +139,7 @@ impl From<ErrorKind> for Error {
         Self {
             kind,
             cause: None,
+            read_head_moved: false,
             message: None,
         }
     }

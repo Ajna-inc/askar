@@ -289,7 +289,7 @@ impl<'a> ManageBackend<'a> for &'a str {
     ) -> BoxFuture<'a, Result<Self::Backend, Error>> {
         Box::pin(async move {
             let opts = self.into_options()?;
-            debug!("Open store with options: {:?}", &opts);
+            debug!("Open store with options: {:?}", opts);
 
             match opts.scheme.as_ref() {
                 #[cfg(feature = "postgres")]
@@ -324,7 +324,7 @@ impl<'a> ManageBackend<'a> for &'a str {
     ) -> BoxFuture<'a, Result<Self::Backend, Error>> {
         Box::pin(async move {
             let opts = self.into_options()?;
-            debug!("Provision store with options: {:?}", &opts);
+            debug!("Provision store with options: {:?}", opts);
 
             match opts.scheme.as_ref() {
                 #[cfg(feature = "postgres")]
@@ -353,7 +353,7 @@ impl<'a> ManageBackend<'a> for &'a str {
     fn remove_backend(self) -> BoxFuture<'a, Result<bool, Error>> {
         Box::pin(async move {
             let opts = self.into_options()?;
-            debug!("Remove store with options: {:?}", &opts);
+            debug!("Remove store with options: {:?}", opts);
 
             match opts.scheme.as_ref() {
                 #[cfg(feature = "postgres")]

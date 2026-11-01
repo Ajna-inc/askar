@@ -10,7 +10,16 @@ use crate::{
 };
 
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
+mod commit;
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) mod db_utils;
+
+pub mod freshness;
+
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+mod db_recovery;
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub use db_recovery::{recovery_stats, RecoveryStats};
 
 #[cfg(feature = "postgres")]
 #[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]
@@ -28,7 +37,7 @@ pub mod sqlite;
 pub mod flatfile;
 
 /// Enum to support custom ordering in record queries
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub enum OrderBy {
     /// Order by ID field
     #[default]

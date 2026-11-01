@@ -29,6 +29,8 @@ pub type ProfileId = i64;
 #[derive(Debug)]
 pub struct KeyCache {
     profile_info: RwLock<HashMap<String, (ProfileId, Arc<ProfileKey>)>>,
+    /// Keys by profile name with the id and the SHA-256 of the wrapped key they came from.
+    verified: RwLock<HashMap<String, (ProfileId, [u8; 32], Arc<ProfileKey>)>>,
     pub(crate) store_key: Arc<StoreKey>,
 }
 
@@ -36,8 +38,40 @@ impl KeyCache {
     pub fn new(store_key: impl Into<Arc<StoreKey>>) -> Self {
         Self {
             profile_info: RwLock::new(HashMap::new()),
+            verified: RwLock::new(HashMap::new()),
             store_key: store_key.into(),
         }
+    }
+
+    /// The key of the profile row `(pid, wrapped key)` just read from the database.
+    ///
+    /// A cached key is returned only for the same profile id and the same wrapped-key
+    /// fingerprint it was unwrapped from; anything else is unwrapped (and thereby
+    /// authenticated under the store key) again. The cache therefore never answers for a
+    /// row it has not seen, whatever happened to the profile in between.
+    pub(crate) async fn resolve_profile(
+        &self,
+        name: &str,
+        pid: ProfileId,
+        fingerprint: [u8; 32],
+        ciphertext: Vec<u8>,
+    ) -> Result<Arc<ProfileKey>, Error> {
+        if let Some((cached_pid, cached_fingerprint, key)) = self.verified.read().await.get(name)
+        {
+            if *cached_pid == pid && *cached_fingerprint == fingerprint {
+                return Ok(key.clone());
+            }
+        }
+        let key = Arc::new(self.load_key(ciphertext).await?);
+        self.verified
+            .write()
+            .await
+            .insert(name.to_owned(), (pid, fingerprint, key.clone()));
+        self.profile_info
+            .write()
+            .await
+            .insert(name.to_owned(), (pid, key.clone()));
+        Ok(key)
     }
 
     pub async fn load_key(&self, ciphertext: Vec<u8>) -> Result<ProfileKey, Error> {
@@ -61,12 +95,14 @@ impl KeyCache {
         self.profile_info.write().await.insert(ident, (pid, key));
     }
 
+    #[cfg_attr(not(feature = "flatfile"), allow(dead_code))]
     pub async fn get_profile(&self, name: &str) -> Option<(ProfileId, Arc<ProfileKey>)> {
         self.profile_info.read().await.get(name).cloned()
     }
 
     pub async fn clear_profile(&self, name: &str) {
         self.profile_info.write().await.remove(name);
+        self.verified.write().await.remove(name);
     }
 }
 
@@ -94,67 +130,4 @@ pub(crate) trait EntryEncryptor {
         enc_value: Vec<u8>,
     ) -> Result<SecretBytes, Error>;
     fn decrypt_entry_tags(&self, enc_tags: Vec<EncEntryTag>) -> Result<Vec<EntryTag>, Error>;
-}
-
-pub struct NullEncryptor;
-
-impl EntryEncryptor for NullEncryptor {
-    fn encrypt_entry_category(&self, category: SecretBytes) -> Result<Vec<u8>, Error> {
-        Ok(category.into_vec())
-    }
-    fn encrypt_entry_name(&self, name: SecretBytes) -> Result<Vec<u8>, Error> {
-        Ok(name.into_vec())
-    }
-    fn encrypt_entry_value(
-        &self,
-        _category: &[u8],
-        _name: &[u8],
-        value: SecretBytes,
-    ) -> Result<Vec<u8>, Error> {
-        Ok(value.into_vec())
-    }
-    fn encrypt_entry_tags(&self, tags: Vec<EntryTag>) -> Result<Vec<EncEntryTag>, Error> {
-        Ok(tags
-            .into_iter()
-            .map(|tag| match tag {
-                EntryTag::Encrypted(name, value) => EncEntryTag {
-                    name: name.into_bytes(),
-                    value: value.into_bytes(),
-                    plaintext: false,
-                },
-                EntryTag::Plaintext(name, value) => EncEntryTag {
-                    name: name.into_bytes(),
-                    value: value.into_bytes(),
-                    plaintext: true,
-                },
-            })
-            .collect())
-    }
-
-    fn decrypt_entry_category(&self, enc_category: Vec<u8>) -> Result<String, Error> {
-        String::from_utf8(enc_category).map_err(err_map!(Encryption))
-    }
-    fn decrypt_entry_name(&self, enc_name: Vec<u8>) -> Result<String, Error> {
-        String::from_utf8(enc_name).map_err(err_map!(Encryption))
-    }
-    fn decrypt_entry_value(
-        &self,
-        _category: &[u8],
-        _name: &[u8],
-        enc_value: Vec<u8>,
-    ) -> Result<SecretBytes, Error> {
-        Ok(enc_value.into())
-    }
-    fn decrypt_entry_tags(&self, enc_tags: Vec<EncEntryTag>) -> Result<Vec<EntryTag>, Error> {
-        enc_tags.into_iter().try_fold(vec![], |mut acc, tag| {
-            let name = String::from_utf8(tag.name).map_err(err_map!(Encryption))?;
-            let value = String::from_utf8(tag.value).map_err(err_map!(Encryption))?;
-            acc.push(if tag.plaintext {
-                EntryTag::Plaintext(name, value)
-            } else {
-                EntryTag::Encrypted(name, value)
-            });
-            Result::<_, Error>::Ok(acc)
-        })
-    }
 }

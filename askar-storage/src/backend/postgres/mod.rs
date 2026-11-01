@@ -10,17 +10,18 @@ use futures_lite::{
 };
 
 use sqlx::{
-    pool::PoolConnection,
     postgres::{PgPool, Postgres},
-    Acquire, Row,
+    Acquire, Row, TransactionManager,
 };
 
 use super::{
+    commit::Committer,
+    db_recovery::reset_depth,
     db_utils::{
         decode_tags, decrypt_scan_batch, encode_profile_key, encode_tag_filter, expiry_timestamp,
-        extend_query, prepare_tags, random_profile_name, replace_arg_placeholders, DbSession,
-        DbSessionActive, DbSessionRef, DbSessionTxn, EncScanEntry, ExtDatabase, QueryParams,
-        QueryPrepare, PAGE_SIZE,
+        extend_query, prepare_tags, random_profile_name, replace_arg_placeholders, Admitted,
+        Connection, DbSession, DbSessionActive, DbSessionRef, DbSessionTxn, EncScanEntry,
+        ExtDatabase, ProfileLock, ProfileRef, QueryParams, QueryPrepare, PAGE_SIZE,
     },
     Backend, BackendSession,
 };
@@ -41,6 +42,10 @@ mod test_db;
 pub use self::test_db::TestDB;
 
 const CONFIG_FETCH_QUERY: &str = "SELECT value FROM config WHERE name = $1";
+const ADMIT_BY_NAME_QUERY: &str = "SELECT (SELECT value FROM config WHERE name = $1),
+    id, name, profile_key FROM profiles WHERE name = $2";
+const ADMIT_BY_ID_QUERY: &str = "SELECT (SELECT value FROM config WHERE name = $1),
+    id, name, profile_key FROM profiles WHERE id = $2";
 const CONFIG_UPDATE_QUERY: &str = "INSERT INTO config (name, value) VALUES ($1, $2)
     ON CONFLICT(name) DO UPDATE SET value = excluded.value";
 const COUNT_QUERY: &str = "SELECT COUNT(*) FROM items i
@@ -92,11 +97,79 @@ pub struct PostgresBackend {
     conn_pool: PgPool,
     active_profile: String,
     key_cache: Arc<KeyCache>,
+    expected_freshness: Option<uuid::Uuid>,
+    committer: Committer<Postgres>,
+    profile_lock: ProfileLock,
     host: String,
     name: String,
 }
 
 impl PostgresBackend {
+    pub(crate) fn with_freshness_lineage(mut self, expected: Option<uuid::Uuid>) -> Self {
+        self.expected_freshness = expected;
+        self
+    }
+    pub(crate) fn with_profile_lock(mut self, lock: ProfileLock) -> Self {
+        self.profile_lock = lock;
+        self
+    }
+
+    async fn check_freshness(&self) -> Result<(), Error> {
+        let mut conn = self.conn_pool.acquire().await?;
+        let mut retry = super::freshness::ReadRetry::new(false);
+        loop {
+            let head = <Postgres as ExtDatabase>::freshness_head(&mut conn, false).await?;
+            if retry.reread(head.as_ref()) {
+                continue;
+            }
+            match super::freshness::check_for(head.as_ref(), self.expected_freshness).await {
+                Ok(()) => return Ok(()),
+                Err(error) if retry.again(&error).await => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    async fn refuse_bound_mutation(&self) -> Result<(), Error> {
+        let mut conn = self.conn_pool.acquire().await?;
+        let head = <Postgres as ExtDatabase>::freshness_head(&mut conn, false).await?;
+        super::freshness::check_for(head.as_ref(), self.expected_freshness).await?;
+        if head.is_some() {
+            return Err(err_msg!(
+                Backend,
+                "Bound store profile and rekey operations are not supported"
+            ));
+        }
+        Ok(())
+    }
+    /// Explicit trusted-current bootstrap. Stop all writers and retain returned lineage
+    /// independently in deployment configuration before serving. Never call on startup.
+    #[cfg(feature = "postgres")]
+    pub async fn bind_freshness(
+        &self,
+        witness: &super::freshness::PostgresWitness,
+    ) -> Result<super::freshness::Head, Error> {
+        let mut conn = self.conn_pool.acquire().await?;
+        <Postgres as ExtDatabase>::start_transaction(&mut conn, false).await?;
+        let result = async {
+            if <Postgres as ExtDatabase>::freshness_head(&mut conn, true)
+                .await?
+                .is_some()
+            {
+                return Err(err_msg!(Backend, "Store already bound"));
+            }
+            let head = super::freshness::Head::initial();
+            witness.register(&head).await?;
+            <Postgres as ExtDatabase>::freshness_write(&mut conn, &head).await?;
+            <Postgres as sqlx::Database>::TransactionManager::commit(&mut conn).await?;
+            Ok(head)
+        }
+        .await;
+        if result.is_err() {
+            <Postgres as sqlx::Database>::TransactionManager::start_rollback(&mut conn);
+        }
+        result
+    }
+
     pub(crate) fn new(
         conn_pool: PgPool,
         active_profile: String,
@@ -108,6 +181,9 @@ impl PostgresBackend {
             conn_pool,
             active_profile,
             key_cache: Arc::new(key_cache),
+            expected_freshness: None,
+            committer: Committer::default(),
+            profile_lock: ProfileLock::default(),
             host,
             name,
         }
@@ -127,22 +203,25 @@ impl Backend for PostgresBackend {
                 Result::<_, Error>::Ok((profile_key, enc_key))
             })
             .await?;
-            let mut conn = self.conn_pool.acquire().await?;
+            let mut tx = self.session(None, true)?;
+            let conn = tx.metadata_connection().await?;
             let res = sqlx::query_scalar(
-                "INSERT INTO profiles (name, profile_key) VALUES ($1, $2) 
+                "INSERT INTO profiles (name, profile_key) VALUES ($1, $2)
                 ON CONFLICT DO NOTHING RETURNING id",
             )
             .bind(&name)
             .bind(enc_key)
-            .fetch_optional(conn.as_mut())
+            .fetch_optional(conn)
             .await?;
-            conn.return_to_pool().await;
             if let Some(pid) = res {
+                tx.freshness_dirty = true;
+                tx.close(true).await?;
                 self.key_cache
                     .add_profile(name.clone(), pid, Arc::new(profile_key))
                     .await;
                 Ok(name)
             } else {
+                tx.close(false).await?;
                 Err(err_msg!(Duplicate, "Duplicate profile name"))
             }
         })
@@ -154,6 +233,7 @@ impl Backend for PostgresBackend {
 
     fn get_default_profile(&self) -> BoxFuture<'_, Result<String, Error>> {
         Box::pin(async move {
+            self.check_freshness().await?;
             let mut conn = self.conn_pool.acquire().await?;
             let profile: Option<String> = sqlx::query_scalar(CONFIG_FETCH_QUERY)
                 .bind("default_profile")
@@ -161,12 +241,14 @@ impl Backend for PostgresBackend {
                 .await
                 .map_err(err_map!(Backend, "Error fetching default profile name"))?;
             conn.return_to_pool().await;
+            self.check_freshness().await?;
             Ok(profile.unwrap_or_default())
         })
     }
 
     fn set_default_profile(&self, profile: String) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move {
+            self.refuse_bound_mutation().await?;
             let mut conn = self.conn_pool.acquire().await?;
             sqlx::query(CONFIG_UPDATE_QUERY)
                 .bind("default_profile")
@@ -181,6 +263,7 @@ impl Backend for PostgresBackend {
 
     fn list_profiles(&self) -> BoxFuture<'_, Result<Vec<String>, Error>> {
         Box::pin(async move {
+            self.check_freshness().await?;
             let mut conn = self.conn_pool.acquire().await?;
             let rows = sqlx::query("SELECT name FROM profiles")
                 .fetch_all(conn.as_mut())
@@ -188,21 +271,24 @@ impl Backend for PostgresBackend {
                 .map_err(err_map!(Backend, "Error fetching profile list"))?;
             let names = rows.into_iter().flat_map(|r| r.try_get(0)).collect();
             conn.return_to_pool().await;
+            self.check_freshness().await?;
             Ok(names)
         })
     }
 
     fn remove_profile(&self, name: String) -> BoxFuture<'_, Result<bool, Error>> {
         Box::pin(async move {
-            let mut conn = self.conn_pool.acquire().await?;
+            let mut tx = self.session(None, true)?;
+            let conn = tx.metadata_connection().await?;
             let ret = sqlx::query("DELETE FROM profiles WHERE name=$1")
                 .bind(&name)
-                .execute(conn.as_mut())
+                .execute(conn)
                 .await
                 .map_err(err_map!(Backend, "Error removing profile"))?
                 .rows_affected()
                 != 0;
-            conn.return_to_pool().await;
+            tx.freshness_dirty = ret;
+            tx.close(ret).await?;
             self.key_cache.clear_profile(&name).await;
             Ok(ret)
         })
@@ -214,6 +300,7 @@ impl Backend for PostgresBackend {
         to_name: String,
     ) -> BoxFuture<'_, Result<bool, Error>> {
         Box::pin(async move {
+            self.refuse_bound_mutation().await?;
             let mut conn = self.conn_pool.acquire().await?;
             let ret = sqlx::query("UPDATE profiles SET name=$1 WHERE name=$2")
                 .bind(&to_name)
@@ -236,6 +323,7 @@ impl Backend for PostgresBackend {
     ) -> BoxFuture<'_, Result<(), Error>> {
         let pass_key = pass_key.into_owned();
         Box::pin(async move {
+            self.refuse_bound_mutation().await?;
             let (store_key, store_key_ref) = unblock(move || method.resolve(pass_key)).await?;
             let store_key = Arc::new(store_key);
             let mut conn = self.conn_pool.acquire().await?;
@@ -326,7 +414,10 @@ impl Backend for PostgresBackend {
             self.key_cache.clone(),
             profile.unwrap_or_else(|| self.active_profile.clone()),
             transaction,
-        ))
+        )
+        .with_freshness_lineage(self.expected_freshness)
+        .with_profile_lock(self.profile_lock)
+        .with_committer(self.committer.clone()))
     }
 
     fn close(&self) -> BoxFuture<'_, Result<(), Error>> {
@@ -354,41 +445,56 @@ impl BackendSession for DbSession<Postgres> {
         category: Option<&'q str>,
         tag_filter: Option<TagFilter>,
     ) -> BoxFuture<'q, Result<i64, Error>> {
-        let enc_category = category.map(|c| ProfileKey::prepare_input(c.as_bytes()));
+        let category = category.map(str::to_owned);
 
         Box::pin(async move {
-            let (profile_id, key) = acquire_key(&mut *self).await?;
-            let mut params = QueryParams::new();
-            params.push(profile_id);
-            params.push(kind.map(|k| k as i16));
-            let (enc_category, tag_filter) = unblock({
-                let params_len = params.len() + 1; // plus category
-                move || {
-                    Result::<_, Error>::Ok((
-                        enc_category
-                            .map(|c| key.encrypt_entry_category(c))
-                            .transpose()?,
-                        encode_tag_filter::<PostgresBackend>(tag_filter, &key, params_len)?,
-                    ))
+            let mut retry = super::freshness::ReadRetry::new(self.in_transaction());
+            loop {
+                let result = async {
+                    let enc_category = category
+                        .as_ref()
+                        .map(|c| ProfileKey::prepare_input(c.as_bytes()));
+                    let tag_filter = tag_filter.clone();
+                    let (profile_id, key) = acquire_key(&mut *self).await?;
+                    let mut params = QueryParams::new();
+                    params.push(profile_id);
+                    params.push(kind.map(|k| k as i16));
+                    let (enc_category, tag_filter) = unblock({
+                        let params_len = params.len() + 1; // plus category
+                        move || {
+                            Result::<_, Error>::Ok((
+                                enc_category
+                                    .map(|c| key.encrypt_entry_category(c))
+                                    .transpose()?,
+                                encode_tag_filter::<PostgresBackend>(tag_filter, &key, params_len)?,
+                            ))
+                        }
+                    })
+                    .await?;
+                    params.push(enc_category);
+                    let query = extend_query::<PostgresBackend>(
+                        COUNT_QUERY,
+                        &mut params,
+                        tag_filter,
+                        None,
+                        None,
+                        None,
+                        false,
+                    )?;
+                    let mut active = acquire_session(&mut *self).await?;
+                    let count = sqlx::query_scalar_with(query.as_str(), params)
+                        .fetch_one(active.connection_mut())
+                        .await
+                        .map_err(err_map!(Backend, "Error performing count query"))?;
+                    active.check_read().await?;
+                    Ok(count)
                 }
-            })
-            .await?;
-            params.push(enc_category);
-            let query = extend_query::<PostgresBackend>(
-                COUNT_QUERY,
-                &mut params,
-                tag_filter,
-                None,
-                None,
-                None,
-                false,
-            )?;
-            let mut active = acquire_session(&mut *self).await?;
-            let count = sqlx::query_scalar_with(query.as_str(), params)
-                .fetch_one(active.connection_mut())
-                .await
-                .map_err(err_map!(Backend, "Error performing count query"))?;
-            Ok(count)
+                .await;
+                match result {
+                    Err(error) if retry.again(&error).await => continue,
+                    result => return result,
+                }
+            }
         })
     }
 
@@ -403,51 +509,66 @@ impl BackendSession for DbSession<Postgres> {
         let name = name.to_string();
 
         Box::pin(async move {
-            let (profile_id, key) = acquire_key(&mut *self).await?;
-            let (enc_category, enc_name) = unblock({
-                let key = key.clone();
-                let category = ProfileKey::prepare_input(category.as_bytes());
-                let name = ProfileKey::prepare_input(name.as_bytes());
-                move || {
-                    Result::<_, Error>::Ok((
-                        key.encrypt_entry_category(category)?,
-                        key.encrypt_entry_name(name)?,
-                    ))
-                }
-            })
-            .await?;
-            let mut active = acquire_session(&mut *self).await?;
-            if let Some(row) = sqlx::query(if for_update && active.in_transaction() {
-                FETCH_QUERY_UPDATE
-            } else {
-                FETCH_QUERY
-            })
-            .bind(profile_id)
-            .bind(kind as i16)
-            .bind(enc_category)
-            .bind(enc_name)
-            .fetch_optional(active.connection_mut())
-            .await
-            .map_err(err_map!(Backend, "Error performing fetch query"))?
-            {
-                let value = row.try_get(1)?;
-                let tags = row.try_get::<Option<String>, _>(2)?.map(String::into_bytes);
-                let (category, name, value, tags) = unblock(move || {
-                    let value = key.decrypt_entry_value(category.as_ref(), name.as_ref(), value)?;
-                    let tags = if let Some(enc_tags) = tags {
-                        key.decrypt_entry_tags(
-                            decode_tags(enc_tags)
-                                .map_err(|_| err_msg!(Unexpected, "Error decoding tags"))?,
-                        )?
+            let mut retry = super::freshness::ReadRetry::new(self.in_transaction());
+            loop {
+                let result = async {
+                    let category = category.clone();
+                    let name = name.clone();
+                    let (profile_id, key) = acquire_key(&mut *self).await?;
+                    let (enc_category, enc_name) = unblock({
+                        let key = key.clone();
+                        let category = ProfileKey::prepare_input(category.as_bytes());
+                        let name = ProfileKey::prepare_input(name.as_bytes());
+                        move || {
+                            Result::<_, Error>::Ok((
+                                key.encrypt_entry_category(category)?,
+                                key.encrypt_entry_name(name)?,
+                            ))
+                        }
+                    })
+                    .await?;
+                    let mut active = acquire_session(&mut *self).await?;
+                    if let Some(row) = sqlx::query(if for_update && active.in_transaction() {
+                        FETCH_QUERY_UPDATE
                     } else {
-                        Vec::new()
-                    };
-                    Result::<_, Error>::Ok((category, name, value, tags))
-                })
-                .await?;
-                Ok(Some(Entry::new(kind, category, name, value, tags)))
-            } else {
-                Ok(None)
+                        FETCH_QUERY
+                    })
+                    .bind(profile_id)
+                    .bind(kind as i16)
+                    .bind(enc_category)
+                    .bind(enc_name)
+                    .fetch_optional(active.connection_mut())
+                    .await
+                    .map_err(err_map!(Backend, "Error performing fetch query"))?
+                    {
+                        let value = row.try_get(1)?;
+                        let tags = row.try_get::<Option<String>, _>(2)?.map(String::into_bytes);
+                        let (category, name, value, tags) = unblock(move || {
+                            let value =
+                                key.decrypt_entry_value(category.as_ref(), name.as_ref(), value)?;
+                            let tags = if let Some(enc_tags) = tags {
+                                key.decrypt_entry_tags(
+                                    decode_tags(enc_tags)
+                                        .map_err(|_| err_msg!(Unexpected, "Error decoding tags"))?,
+                                )?
+                            } else {
+                                Vec::new()
+                            };
+                            Result::<_, Error>::Ok((category, name, value, tags))
+                        })
+                        .await?;
+                        active.check_read().await?;
+                        Ok(Some(Entry::new(kind, category, name, value, tags)))
+                    } else {
+                        active.check_read().await?;
+                        Ok(None)
+                    }
+                }
+                .await;
+                match result {
+                    Err(error) if retry.again(&error).await => continue,
+                    result => return result,
+                }
             }
         })
     }
@@ -464,28 +585,44 @@ impl BackendSession for DbSession<Postgres> {
     ) -> BoxFuture<'q, Result<Vec<Entry>, Error>> {
         let category = category.map(|c| c.to_string());
         Box::pin(async move {
-            let for_update = for_update && self.in_transaction();
-            let mut active = self.borrow_mut();
-            let (profile_id, key) = acquire_key(&mut active).await?;
-            let scan = perform_scan(
-                active,
-                profile_id,
-                key.clone(),
-                kind,
-                category.clone(),
-                tag_filter,
-                None,
-                limit,
-                order_by,
-                descending,
-                for_update,
-            );
-            pin!(scan);
-            let mut enc_rows = vec![];
-            while let Some(rows) = scan.try_next().await? {
-                enc_rows.extend(rows)
+            let mut retry = super::freshness::ReadRetry::new(self.in_transaction());
+            loop {
+                let result = async {
+                    let category = category.clone();
+                    let tag_filter = tag_filter.clone();
+                    let for_update = for_update && self.in_transaction();
+                    let rows = {
+                        let mut active = self.borrow_mut();
+                        let (profile_id, key) = acquire_key(&mut active).await?;
+                        let scan = perform_scan(
+                            active,
+                            profile_id,
+                            key.clone(),
+                            kind,
+                            category.clone(),
+                            tag_filter,
+                            None,
+                            limit,
+                            order_by,
+                            descending,
+                            for_update,
+                        );
+                        pin!(scan);
+                        let mut enc_rows = vec![];
+                        while let Some(rows) = scan.try_next().await? {
+                            enc_rows.extend(rows)
+                        }
+                        unblock(move || decrypt_scan_batch(category, enc_rows, &key)).await?
+                    };
+                    self.validate_read_head().await?;
+                    Ok(rows)
+                }
+                .await;
+                match result {
+                    Err(error) if retry.again(&error).await => continue,
+                    result => return result,
+                }
             }
-            unblock(move || decrypt_scan_batch(category, enc_rows, &key)).await
         })
     }
 
@@ -526,10 +663,15 @@ impl BackendSession for DbSession<Postgres> {
             )?;
 
             let mut active = acquire_session(&mut *self).await?;
+            let mut txn = active.as_transaction().await?;
             let removed = sqlx::query_with(query.as_str(), params)
-                .execute(active.connection_mut())
+                .execute(txn.connection_mut())
                 .await?
                 .rows_affected();
+            if removed != 0 {
+                txn.mark_dirty();
+            }
+            txn.commit().await?;
             Ok(removed as i64)
         })
     }
@@ -566,6 +708,7 @@ impl BackendSession for DbSession<Postgres> {
                         ))
                     })
                     .await?;
+                    self.freshness_dirty = true;
                     let mut active = acquire_session(&mut *self).await?;
                     let mut txn = active.as_transaction().await?;
                     perform_insert(
@@ -594,7 +737,11 @@ impl BackendSession for DbSession<Postgres> {
                 })
                 .await?;
                 let mut active = acquire_session(&mut *self).await?;
-                perform_remove(&mut active, kind, &enc_category, &enc_name, false).await
+                let mut txn = active.as_transaction().await?;
+                perform_remove(&mut txn, kind, &enc_category, &enc_name, false).await?;
+                txn.mark_dirty();
+                txn.commit().await?;
+                Ok(())
             }),
         }
     }
@@ -607,7 +754,7 @@ impl BackendSession for DbSession<Postgres> {
                 sqlx::Connection::ping(sess.connection_mut())
                     .await
                     .map_err(err_map!(Backend, "Error pinging session"))?;
-            } else {
+            } else if !sess.profile_checked() {
                 let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM profiles WHERE id=$1")
                     .bind(sess.profile_id)
                     .fetch_one(sess.connection_mut())
@@ -617,6 +764,7 @@ impl BackendSession for DbSession<Postgres> {
                     return Err(err_msg!(NotFound, "Session profile has been removed"));
                 }
             }
+            // Otherwise this activation's admission statement just read the profile row.
             Ok(())
         })
     }
@@ -626,7 +774,122 @@ impl BackendSession for DbSession<Postgres> {
     }
 }
 
-impl ExtDatabase for Postgres {}
+impl ExtDatabase for Postgres {
+    fn admission<'a>(
+        conn: &'a mut Connection<Self>,
+        profile: ProfileRef<'a>,
+        lock: Option<ProfileLock>,
+    ) -> BoxFuture<'a, Result<Admitted, Error>> {
+        Box::pin(async move {
+            // One round trip: the head, read without a lock, beside the profile row. Only
+            // the profile row is locked, and only inside a transaction: outside one a row
+            // lock ends with the statement and protects nothing, but taking it would wait
+            // for every transaction holding the row, which may be the very one this session
+            // is serving from another connection.
+            let base = match profile {
+                ProfileRef::None => {
+                    let head = Self::freshness_head(conn, false).await?;
+                    return Ok(Admitted {
+                        head,
+                        profile: None,
+                    });
+                }
+                ProfileRef::Name(_) => ADMIT_BY_NAME_QUERY,
+                ProfileRef::Id(_) => ADMIT_BY_ID_QUERY,
+            };
+            let query = match lock {
+                None => std::borrow::Cow::Borrowed(base),
+                Some(ProfileLock::NoKeyUpdate) => format!("{base} FOR NO KEY UPDATE").into(),
+                Some(ProfileLock::KeyShare) => format!("{base} FOR KEY SHARE").into(),
+            };
+            let query = sqlx::query(query.as_ref()).bind(super::freshness::HEAD_KEY);
+            let query = match profile {
+                ProfileRef::Name(name) => query.bind(name),
+                ProfileRef::Id(id) => query.bind(id),
+                ProfileRef::None => unreachable!(),
+            };
+            let Some(row) = query.fetch_optional(&mut *conn).await? else {
+                // No such profile. The store is still checked before that is reported.
+                let head = Self::freshness_head(conn, false).await?;
+                return Ok(Admitted {
+                    head,
+                    profile: None,
+                });
+            };
+            let head = row
+                .try_get::<Option<String>, _>(0)?
+                .map(|value| super::freshness::Head::decode(&value))
+                .transpose()?;
+            Ok(Admitted {
+                head,
+                profile: Some((row.try_get(1)?, row.try_get(2)?, row.try_get(3)?)),
+            })
+        })
+    }
+
+    fn freshness_head(
+        conn: &mut Connection<Self>,
+        lock: bool,
+    ) -> BoxFuture<'_, Result<Option<super::freshness::Head>, Error>> {
+        Box::pin(async move {
+            // The locking read also makes the transaction's COMMIT synchronous, in the same
+            // round trip: it is the first statement of a head advance.
+            let query = if lock {
+                "SELECT value, set_config('synchronous_commit', 'on', true) FROM config
+                WHERE name = $1 FOR UPDATE"
+            } else {
+                CONFIG_FETCH_QUERY
+            };
+            let row = sqlx::query(query)
+                .bind(super::freshness::HEAD_KEY)
+                .fetch_optional(conn)
+                .await?;
+            row.map(|row| super::freshness::Head::decode(row.try_get::<&str, _>(0)?))
+                .transpose()
+        })
+    }
+    fn freshness_advance<'a>(
+        conn: &'a mut Connection<Self>,
+        head: &'a super::freshness::Head,
+    ) -> BoxFuture<'a, Result<(), Error>> {
+        Box::pin(async move {
+            sqlx::query(CONFIG_UPDATE_QUERY)
+                .bind(super::freshness::HEAD_KEY)
+                .bind(head.encode()?)
+                .execute(conn)
+                .await?;
+            Ok(())
+        })
+    }
+    fn freshness_write<'a>(
+        conn: &'a mut Connection<Self>,
+        head: &'a super::freshness::Head,
+    ) -> BoxFuture<'a, Result<(), Error>> {
+        Box::pin(async move {
+            sqlx::query("SET LOCAL synchronous_commit = on")
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query(CONFIG_UPDATE_QUERY)
+                .bind(super::freshness::HEAD_KEY)
+                .bind(head.encode()?)
+                .execute(conn)
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn reset_connection(conn: &mut Connection<Self>) -> BoxFuture<'_, bool> {
+        Box::pin(async move {
+            // A BEGIN interrupted before its acknowledgement can leave the
+            // server inside a transaction that sqlx does not count. ROLLBACK
+            // outside a transaction is only a warning.
+            reset_depth::<Self>(conn).await
+                && sqlx::Executor::execute(&mut *conn, "ROLLBACK")
+                    .await
+                    .is_ok()
+        })
+    }
+}
 
 impl QueryPrepare for PostgresBackend {
     type DB = Postgres;
@@ -655,9 +918,14 @@ impl QueryPrepare for PostgresBackend {
     }
 }
 
+/// The session's profile key. Only a session's first use needs the database for it; the
+/// admission of each operation is the one `acquire_session` performs before its statement.
 async fn acquire_key(
     session: &mut DbSession<Postgres>,
 ) -> Result<(ProfileId, Arc<ProfileKey>), Error> {
+    if let Some(resolved) = session.profile_and_key() {
+        return Ok(resolved);
+    }
     acquire_session(session).await?;
     Ok(session.profile_and_key().unwrap())
 }
@@ -665,41 +933,7 @@ async fn acquire_key(
 async fn acquire_session(
     session: &'_ mut DbSession<Postgres>,
 ) -> Result<DbSessionActive<'_, Postgres>, Error> {
-    session.make_active(&resolve_profile_key).await
-}
-
-async fn resolve_profile_key(
-    conn: &mut PoolConnection<Postgres>,
-    cache: Arc<KeyCache>,
-    profile: String,
-    in_txn: bool,
-) -> Result<(ProfileId, Arc<ProfileKey>), Error> {
-    if let Some((pid, key)) = cache.get_profile(profile.as_str()).await {
-        if in_txn {
-            // lock the profile row to prevent it from being removed
-            let check: Option<i64> =
-                sqlx::query_scalar("SELECT id FROM profiles WHERE id=$1 FOR NO KEY UPDATE")
-                    .bind(pid)
-                    .fetch_optional(conn.as_mut())
-                    .await?;
-            if check.is_none() {
-                return Err(err_msg!(NotFound, "Session profile has been removed"));
-            }
-        }
-        Ok((pid, key))
-    } else if let Some(row) =
-        sqlx::query("SELECT id, profile_key FROM profiles WHERE name=$1 FOR NO KEY UPDATE")
-            .bind(profile.as_str())
-            .fetch_optional(conn.as_mut())
-            .await?
-    {
-        let pid = row.try_get(0)?;
-        let key = Arc::new(cache.load_key(row.try_get(1)?).await?);
-        cache.add_profile(profile, pid, key.clone()).await;
-        Ok((pid, key))
-    } else {
-        Err(err_msg!(NotFound, "Profile not found"))
-    }
+    session.make_active().await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -760,7 +994,7 @@ async fn perform_insert(
 }
 
 async fn perform_remove(
-    active: &mut DbSessionActive<'_, Postgres>,
+    active: &mut DbSessionTxn<'_, Postgres>,
     kind: EntryKind,
     enc_category: &[u8],
     enc_name: &[u8],
@@ -821,6 +1055,7 @@ fn perform_scan(
         let mut batch = Vec::with_capacity(PAGE_SIZE);
 
         let mut acquired = acquire_session(&mut active).await?;
+        let admitted = acquired.read_guard();
         let mut rows = sqlx::query_with(query.as_str(), params).fetch(acquired.connection_mut());
         while let Some(row) = rows.try_next().await? {
             let tags = row.try_get::<Option<String>, _>(5)?.map(String::into_bytes).unwrap_or_default();
@@ -830,6 +1065,7 @@ fn perform_scan(
                 kind, category: row.try_get(2)?, name: row.try_get(3)?, value: row.try_get(4)?, tags
             });
             if batch.len() == PAGE_SIZE {
+                admitted.check().await?;
                 yield batch.split_off(0);
             }
         }
@@ -840,6 +1076,7 @@ fn perform_scan(
         drop(active);
 
         if !batch.is_empty() {
+            admitted.check().await?;
             yield batch;
         }
     }

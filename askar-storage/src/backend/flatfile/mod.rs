@@ -44,6 +44,20 @@ use crate::{
 mod provision;
 pub use provision::FlatFileStoreOptions;
 
+// The flat-file engine has no atomic external commit integration. Never silently
+// accept it in a deployment configured for independently witnessed freshness.
+fn refuse_freshness_deployment() -> Result<(), Error> {
+    if std::env::var_os("ASKAR_FRESHNESS_LINEAGE").is_some()
+        || std::env::var_os("ASKAR_FRESHNESS_WITNESS_URL").is_some()
+    {
+        return Err(err_msg!(
+            Unsupported,
+            "Freshness-bound deployments do not support flat-file storage"
+        ));
+    }
+    Ok(())
+}
+
 const CONFIG_FILE: &str = ".config";
 const STORE_KEY_FILE: &str = ".store_key";
 const PROFILE_KEY_FILE: &str = ".profile_key";
@@ -56,27 +70,17 @@ fn matches_tag_filter(tags: &[EntryTag], query: &wql::Query) -> bool {
     use wql::Query;
 
     match query {
-        Query::Eq(name, value) => {
-            tags.iter().any(|t| t.name() == name && t.value() == value)
-        }
-        Query::Neq(name, value) => {
-            !tags.iter().any(|t| t.name() == name && t.value() == value)
-        }
-        Query::And(queries) => {
-            queries.iter().all(|q| matches_tag_filter(tags, q))
-        }
-        Query::Or(queries) => {
-            queries.iter().any(|q| matches_tag_filter(tags, q))
-        }
-        Query::Not(q) => {
-            !matches_tag_filter(tags, q)
-        }
-        Query::In(name, values) => {
-            tags.iter().any(|t| t.name() == name && values.contains(&t.value().to_string()))
-        }
-        Query::Exist(names) => {
-            names.iter().all(|name| tags.iter().any(|t| t.name() == name))
-        }
+        Query::Eq(name, value) => tags.iter().any(|t| t.name() == name && t.value() == value),
+        Query::Neq(name, value) => !tags.iter().any(|t| t.name() == name && t.value() == value),
+        Query::And(queries) => queries.iter().all(|q| matches_tag_filter(tags, q)),
+        Query::Or(queries) => queries.iter().any(|q| matches_tag_filter(tags, q)),
+        Query::Not(q) => !matches_tag_filter(tags, q),
+        Query::In(name, values) => tags
+            .iter()
+            .any(|t| t.name() == name && values.contains(&t.value().to_string())),
+        Query::Exist(names) => names
+            .iter()
+            .all(|name| tags.iter().any(|t| t.name() == name)),
         _ => true, // For unsupported filters, allow all
     }
 }
@@ -149,20 +153,29 @@ impl EntryFile {
 
         // Read category
         if pos + 2 > data.len() {
-            return Err(err_msg!(Unexpected, "Invalid entry file: truncated category length"));
+            return Err(err_msg!(
+                Unexpected,
+                "Invalid entry file: truncated category length"
+            ));
         }
         let category_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
 
         if pos + category_len > data.len() {
-            return Err(err_msg!(Unexpected, "Invalid entry file: truncated category"));
+            return Err(err_msg!(
+                Unexpected,
+                "Invalid entry file: truncated category"
+            ));
         }
         let category = data[pos..pos + category_len].to_vec();
         pos += category_len;
 
         // Read name
         if pos + 2 > data.len() {
-            return Err(err_msg!(Unexpected, "Invalid entry file: truncated name length"));
+            return Err(err_msg!(
+                Unexpected,
+                "Invalid entry file: truncated name length"
+            ));
         }
         let name_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
@@ -175,9 +188,13 @@ impl EntryFile {
 
         // Read value
         if pos + 4 > data.len() {
-            return Err(err_msg!(Unexpected, "Invalid entry file: truncated value length"));
+            return Err(err_msg!(
+                Unexpected,
+                "Invalid entry file: truncated value length"
+            ));
         }
-        let value_len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let value_len =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
 
         if pos + value_len > data.len() {
@@ -188,7 +205,10 @@ impl EntryFile {
 
         // Read tags
         if pos + 2 > data.len() {
-            return Err(err_msg!(Unexpected, "Invalid entry file: truncated tag count"));
+            return Err(err_msg!(
+                Unexpected,
+                "Invalid entry file: truncated tag count"
+            ));
         }
         let tag_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
@@ -196,31 +216,46 @@ impl EntryFile {
         let mut tags = Vec::with_capacity(tag_count);
         for _ in 0..tag_count {
             if pos + 1 > data.len() {
-                return Err(err_msg!(Unexpected, "Invalid entry file: truncated tag plaintext flag"));
+                return Err(err_msg!(
+                    Unexpected,
+                    "Invalid entry file: truncated tag plaintext flag"
+                ));
             }
             let plaintext = data[pos] != 0;
             pos += 1;
 
             if pos + 2 > data.len() {
-                return Err(err_msg!(Unexpected, "Invalid entry file: truncated tag name length"));
+                return Err(err_msg!(
+                    Unexpected,
+                    "Invalid entry file: truncated tag name length"
+                ));
             }
             let tag_name_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
             pos += 2;
 
             if pos + tag_name_len > data.len() {
-                return Err(err_msg!(Unexpected, "Invalid entry file: truncated tag name"));
+                return Err(err_msg!(
+                    Unexpected,
+                    "Invalid entry file: truncated tag name"
+                ));
             }
             let tag_name = data[pos..pos + tag_name_len].to_vec();
             pos += tag_name_len;
 
             if pos + 2 > data.len() {
-                return Err(err_msg!(Unexpected, "Invalid entry file: truncated tag value length"));
+                return Err(err_msg!(
+                    Unexpected,
+                    "Invalid entry file: truncated tag value length"
+                ));
             }
             let tag_value_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
             pos += 2;
 
             if pos + tag_value_len > data.len() {
-                return Err(err_msg!(Unexpected, "Invalid entry file: truncated tag value"));
+                return Err(err_msg!(
+                    Unexpected,
+                    "Invalid entry file: truncated tag value"
+                ));
             }
             let tag_value = data[pos..pos + tag_value_len].to_vec();
             pos += tag_value_len;
@@ -318,7 +353,9 @@ impl FlatFileBackend {
     }
 
     fn rebuild_index(&self) -> Result<(), Error> {
-        let mut index = self.index.write()
+        let mut index = self
+            .index
+            .write()
             .map_err(|_| err_msg!(Backend, "Failed to acquire write lock on index"))?;
 
         index.clear();
@@ -329,16 +366,15 @@ impl FlatFileBackend {
 
         for profile in &config.profiles {
             // Only rebuild index for profiles that have keys loaded in cache
-            let profile_key = match futures_lite::future::block_on(
-                self.key_cache.get_profile(profile)
-            ) {
-                Some((_id, key)) => key,
-                None => {
-                    // Profile key not in cache, skip this profile
-                    // We'll load entries on-demand when this profile is accessed
-                    continue;
-                }
-            };
+            let profile_key =
+                match futures_lite::future::block_on(self.key_cache.get_profile(profile)) {
+                    Some((_id, key)) => key,
+                    None => {
+                        // Profile key not in cache, skip this profile
+                        // We'll load entries on-demand when this profile is accessed
+                        continue;
+                    }
+                };
 
             let entries_dir = self.entries_dir(profile);
             if !entries_dir.exists() {
@@ -421,6 +457,7 @@ impl Backend for FlatFileBackend {
 
     fn create_profile(&self, name: Option<String>) -> BoxFuture<'_, Result<String, Error>> {
         Box::pin(async move {
+            refuse_freshness_deployment()?;
             let profile_name = name.unwrap_or_else(|| {
                 use rand::Rng;
                 let mut rng = rand::thread_rng();
@@ -445,7 +482,10 @@ impl Backend for FlatFileBackend {
             // Create profile key
             let profile_key = ProfileKey::new()?;
             let profile_id = config.profiles.len() as i64; // Simple counter
-            let encoded_key = self.key_cache.store_key.wrap_data(profile_key.to_bytes()?)?;
+            let encoded_key = self
+                .key_cache
+                .store_key
+                .wrap_data(profile_key.to_bytes()?)?;
 
             // Store encrypted profile key
             let profile_key_path = profile_dir.join(PROFILE_KEY_FILE);
@@ -461,13 +501,17 @@ impl Backend for FlatFileBackend {
 
             // Update index and key cache
             {
-                let mut index = self.index.write()
+                let mut index = self
+                    .index
+                    .write()
                     .map_err(|_| err_msg!(Backend, "Failed to acquire write lock on index"))?;
                 index.insert(profile_name.clone(), Vec::new());
             } // Drop lock before async call
 
             // Add to key cache
-            self.key_cache.add_profile(profile_name.clone(), profile_id, Arc::new(profile_key)).await;
+            self.key_cache
+                .add_profile(profile_name.clone(), profile_id, Arc::new(profile_key))
+                .await;
 
             Ok(profile_name)
         })
@@ -479,6 +523,7 @@ impl Backend for FlatFileBackend {
 
     fn get_default_profile(&self) -> BoxFuture<'_, Result<String, Error>> {
         Box::pin(async move {
+            refuse_freshness_deployment()?;
             let config = self.read_config()?;
             Ok(config.default_profile)
         })
@@ -486,6 +531,7 @@ impl Backend for FlatFileBackend {
 
     fn set_default_profile(&self, profile: String) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move {
+            refuse_freshness_deployment()?;
             let mut config = self.read_config()?;
 
             if !config.profiles.contains(&profile) {
@@ -501,6 +547,7 @@ impl Backend for FlatFileBackend {
 
     fn list_profiles(&self) -> BoxFuture<'_, Result<Vec<String>, Error>> {
         Box::pin(async move {
+            refuse_freshness_deployment()?;
             let config = self.read_config()?;
             Ok(config.profiles)
         })
@@ -508,6 +555,7 @@ impl Backend for FlatFileBackend {
 
     fn remove_profile(&self, name: String) -> BoxFuture<'_, Result<bool, Error>> {
         Box::pin(async move {
+            refuse_freshness_deployment()?;
             let mut config = self.read_config()?;
 
             if !config.profiles.contains(&name) {
@@ -529,7 +577,9 @@ impl Backend for FlatFileBackend {
             self.write_config(&config)?;
 
             // Update index
-            let mut index = self.index.write()
+            let mut index = self
+                .index
+                .write()
                 .map_err(|_| err_msg!(Backend, "Failed to acquire write lock on index"))?;
             index.remove(&name);
 
@@ -543,6 +593,7 @@ impl Backend for FlatFileBackend {
         to_name: String,
     ) -> BoxFuture<'_, Result<bool, Error>> {
         Box::pin(async move {
+            refuse_freshness_deployment()?;
             let mut config = self.read_config()?;
 
             if !config.profiles.contains(&from_name) {
@@ -569,7 +620,9 @@ impl Backend for FlatFileBackend {
             self.write_config(&config)?;
 
             // Update index
-            let mut index = self.index.write()
+            let mut index = self
+                .index
+                .write()
                 .map_err(|_| err_msg!(Backend, "Failed to acquire write lock on index"))?;
             if let Some(entries) = index.remove(&from_name) {
                 index.insert(to_name, entries);
@@ -591,14 +644,21 @@ impl Backend for FlatFileBackend {
         _descending: bool,
     ) -> BoxFuture<'_, Result<Scan<'static, Entry>, Error>> {
         Box::pin(async move {
+            refuse_freshness_deployment()?;
             let profile = profile.unwrap_or_else(|| self.active_profile.clone());
-            let (_profile_id, profile_key) = self.key_cache.get_profile(&profile).await
+            let (_profile_id, profile_key) = self
+                .key_cache
+                .get_profile(&profile)
+                .await
                 .ok_or_else(|| err_msg!(NotFound, "Profile not found"))?;
 
-            let index = self.index.read()
+            let index = self
+                .index
+                .read()
                 .map_err(|_| err_msg!(Backend, "Failed to acquire read lock on index"))?;
 
-            let entries = index.get(&profile)
+            let entries = index
+                .get(&profile)
                 .ok_or_else(|| err_msg!(NotFound, "Profile not found"))?
                 .clone();
 
@@ -702,6 +762,7 @@ impl Backend for FlatFileBackend {
     }
 
     fn session(&self, profile: Option<String>, transaction: bool) -> Result<Self::Session, Error> {
+        refuse_freshness_deployment()?;
         let profile = profile.unwrap_or_else(|| self.active_profile.clone());
 
         Ok(FlatFileSession {
@@ -718,16 +779,21 @@ impl Backend for FlatFileBackend {
         _key: PassKey<'_>,
     ) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move {
+            refuse_freshness_deployment()?;
             // Re-encrypt all profile keys with new store key
             let _config = self.read_config()?;
 
             // This is complex - for now, return error
-            Err(err_msg!(Unsupported, "Rekey not yet implemented for flat file backend"))
+            Err(err_msg!(
+                Unsupported,
+                "Rekey not yet implemented for flat file backend"
+            ))
         })
     }
 
     fn close(&self) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move {
+            refuse_freshness_deployment()?;
             Ok(())
         })
     }
@@ -770,19 +836,28 @@ impl BackendSession for FlatFileSession {
         tag_filter: Option<TagFilter>,
     ) -> BoxFuture<'q, Result<i64, Error>> {
         Box::pin(async move {
+            refuse_freshness_deployment()?;
             // Get profile key if we need tag filtering
             let profile_key = if tag_filter.is_some() {
-                let (_, key) = self.backend.key_cache.get_profile(&self.profile).await
+                let (_, key) = self
+                    .backend
+                    .key_cache
+                    .get_profile(&self.profile)
+                    .await
                     .ok_or_else(|| err_msg!(NotFound, "Profile not found"))?;
                 Some(key)
             } else {
                 None
             };
 
-            let index = self.backend.index.read()
+            let index = self
+                .backend
+                .index
+                .read()
                 .map_err(|_| err_msg!(Backend, "Failed to acquire read lock on index"))?;
 
-            let entries = index.get(&self.profile)
+            let entries = index
+                .get(&self.profile)
                 .ok_or_else(|| err_msg!(NotFound, "Profile not found"))?;
 
             let mut count = 0;
@@ -810,7 +885,9 @@ impl BackendSession for FlatFileSession {
 
                         // Decrypt and decode
                         let entry_file = EntryFile::decode(&data)?;
-                        let tags = entry_file.tags.into_iter()
+                        let tags = entry_file
+                            .tags
+                            .into_iter()
                             .map(|(is_plaintext, tag_name, tag_value)| {
                                 if is_plaintext {
                                     Ok(EntryTag::Encrypted(
@@ -819,9 +896,13 @@ impl BackendSession for FlatFileSession {
                                     ))
                                 } else {
                                     let dec_name_bytes = key.decrypt_tag_name(tag_name)?;
-                                    let dec_name = String::from_utf8_lossy(&dec_name_bytes.into_vec()).to_string();
+                                    let dec_name =
+                                        String::from_utf8_lossy(&dec_name_bytes.into_vec())
+                                            .to_string();
                                     let dec_value_bytes = key.decrypt_tag_value(tag_value)?;
-                                    let dec_value = String::from_utf8_lossy(&dec_value_bytes.into_vec()).to_string();
+                                    let dec_value =
+                                        String::from_utf8_lossy(&dec_value_bytes.into_vec())
+                                            .to_string();
                                     Ok(EntryTag::Encrypted(dec_name, dec_value))
                                 }
                             })
@@ -849,17 +930,27 @@ impl BackendSession for FlatFileSession {
         _for_update: bool,
     ) -> BoxFuture<'q, Result<Option<Entry>, Error>> {
         Box::pin(async move {
-            let (_profile_id, profile_key) = self.backend.key_cache.get_profile(&self.profile).await
+            refuse_freshness_deployment()?;
+            let (_profile_id, profile_key) = self
+                .backend
+                .key_cache
+                .get_profile(&self.profile)
+                .await
                 .ok_or_else(|| err_msg!(NotFound, "Profile not found"))?;
 
-            let index = self.backend.index.read()
+            let index = self
+                .backend
+                .index
+                .read()
                 .map_err(|_| err_msg!(Backend, "Failed to acquire read lock on index"))?;
 
-            let entries = index.get(&self.profile)
+            let entries = index
+                .get(&self.profile)
                 .ok_or_else(|| err_msg!(NotFound, "Profile not found"))?;
 
             // Find matching entry
-            let entry_idx = entries.iter()
+            let entry_idx = entries
+                .iter()
                 .find(|e| e.kind == kind && e.category == category && e.name == name);
 
             let entry_idx = match entry_idx {
@@ -881,10 +972,15 @@ impl BackendSession for FlatFileSession {
             let entry_file = EntryFile::decode(&data)?;
 
             // Decrypt entry (category, name, value)
-            let decrypted_category = profile_key.decrypt_entry_category(entry_file.category.clone())?;
+            let decrypted_category =
+                profile_key.decrypt_entry_category(entry_file.category.clone())?;
             let decrypted_name = profile_key.decrypt_entry_name(entry_file.name.clone())?;
 
-            let decrypted_value = profile_key.decrypt_entry_value(&entry_file.category, &entry_file.name, entry_file.value.clone())?;
+            let decrypted_value = profile_key.decrypt_entry_value(
+                &entry_file.category,
+                &entry_file.name,
+                entry_file.value.clone(),
+            )?;
 
             let mut tags = Vec::new();
             for (plaintext, tag_name, tag_value) in &entry_file.tags {
@@ -897,7 +993,8 @@ impl BackendSession for FlatFileSession {
                     let dec_name_bytes = profile_key.decrypt_tag_name(tag_name.clone())?;
                     let dec_name = String::from_utf8_lossy(&dec_name_bytes.into_vec()).to_string();
                     let dec_value_bytes = profile_key.decrypt_tag_value(tag_value.clone())?;
-                    let dec_value = String::from_utf8_lossy(&dec_value_bytes.into_vec()).to_string();
+                    let dec_value =
+                        String::from_utf8_lossy(&dec_value_bytes.into_vec()).to_string();
                     EntryTag::Encrypted(dec_name, dec_value)
                 };
                 tags.push(tag);
@@ -926,13 +1023,22 @@ impl BackendSession for FlatFileSession {
         _for_update: bool,
     ) -> BoxFuture<'q, Result<Vec<Entry>, Error>> {
         Box::pin(async move {
-            let (_profile_id, profile_key) = self.backend.key_cache.get_profile(&self.profile).await
+            refuse_freshness_deployment()?;
+            let (_profile_id, profile_key) = self
+                .backend
+                .key_cache
+                .get_profile(&self.profile)
+                .await
                 .ok_or_else(|| err_msg!(NotFound, "Profile not found"))?;
 
-            let index = self.backend.index.read()
+            let index = self
+                .backend
+                .index
+                .read()
                 .map_err(|_| err_msg!(Backend, "Failed to acquire read lock on index"))?;
 
-            let entries = index.get(&self.profile)
+            let entries = index
+                .get(&self.profile)
                 .ok_or_else(|| err_msg!(NotFound, "Profile not found"))?
                 .clone();
 
@@ -965,10 +1071,15 @@ impl BackendSession for FlatFileSession {
                 let entry_file = EntryFile::decode(&data)?;
 
                 // Decrypt entry (category, name, value)
-                let decrypted_category = profile_key.decrypt_entry_category(entry_file.category.clone())?;
+                let decrypted_category =
+                    profile_key.decrypt_entry_category(entry_file.category.clone())?;
                 let decrypted_name = profile_key.decrypt_entry_name(entry_file.name.clone())?;
 
-                let decrypted_value = profile_key.decrypt_entry_value(&entry_file.category, &entry_file.name, entry_file.value.clone())?;
+                let decrypted_value = profile_key.decrypt_entry_value(
+                    &entry_file.category,
+                    &entry_file.name,
+                    entry_file.value.clone(),
+                )?;
 
                 let mut tags = Vec::new();
                 for (plaintext, tag_name, tag_value) in &entry_file.tags {
@@ -979,9 +1090,11 @@ impl BackendSession for FlatFileSession {
                         )
                     } else {
                         let dec_name_bytes = profile_key.decrypt_tag_name(tag_name.clone())?;
-                        let dec_name = String::from_utf8_lossy(&dec_name_bytes.into_vec()).to_string();
+                        let dec_name =
+                            String::from_utf8_lossy(&dec_name_bytes.into_vec()).to_string();
                         let dec_value_bytes = profile_key.decrypt_tag_value(tag_value.clone())?;
-                        let dec_value = String::from_utf8_lossy(&dec_value_bytes.into_vec()).to_string();
+                        let dec_value =
+                            String::from_utf8_lossy(&dec_value_bytes.into_vec()).to_string();
                         EntryTag::Encrypted(dec_name, dec_value)
                     };
                     tags.push(tag);
@@ -1022,6 +1135,7 @@ impl BackendSession for FlatFileSession {
         _tag_filter: Option<TagFilter>,
     ) -> BoxFuture<'q, Result<i64, Error>> {
         Box::pin(async move {
+            refuse_freshness_deployment()?;
             // TODO: Implement remove_all
             Err(err_msg!(Unsupported, "remove_all not yet implemented"))
         })
@@ -1038,21 +1152,31 @@ impl BackendSession for FlatFileSession {
         _expiry_ms: Option<i64>,
     ) -> BoxFuture<'q, Result<(), Error>> {
         Box::pin(async move {
-            let (_profile_id, profile_key) = self.backend.key_cache.get_profile(&self.profile).await
+            refuse_freshness_deployment()?;
+            let (_profile_id, profile_key) = self
+                .backend
+                .key_cache
+                .get_profile(&self.profile)
+                .await
                 .ok_or_else(|| err_msg!(NotFound, "Profile not found"))?;
 
             match operation {
                 EntryOperation::Insert | EntryOperation::Replace => {
-                    let value = value.ok_or_else(|| err_msg!(Input, "Value required for insert/replace"))?;
+                    let value = value
+                        .ok_or_else(|| err_msg!(Input, "Value required for insert/replace"))?;
 
                     // Check entry existence based on operation type
-                    let index = self.backend.index.read()
-                        .map_err(|_| err_msg!(Backend, "Failed to acquire read lock on index"))?;
+                    let index =
+                        self.backend.index.read().map_err(|_| {
+                            err_msg!(Backend, "Failed to acquire read lock on index")
+                        })?;
 
-                    let entries = index.get(&self.profile)
+                    let entries = index
+                        .get(&self.profile)
                         .ok_or_else(|| err_msg!(NotFound, "Profile not found"))?;
 
-                    let entry_exists = entries.iter()
+                    let entry_exists = entries
+                        .iter()
                         .any(|e| e.kind == kind && e.category == category && e.name == name);
 
                     drop(index); // Release read lock
@@ -1069,21 +1193,34 @@ impl BackendSession for FlatFileSession {
                     }
 
                     // Encrypt data
-                    let enc_category = profile_key.encrypt_entry_category(SecretBytes::from(category.as_bytes()))?;
-                    let enc_name = profile_key.encrypt_entry_name(SecretBytes::from(name.as_bytes()))?;
-                    let enc_value = profile_key.encrypt_entry_value(&enc_category, &enc_name, SecretBytes::from(value))?;
+                    let enc_category = profile_key
+                        .encrypt_entry_category(SecretBytes::from(category.as_bytes()))?;
+                    let enc_name =
+                        profile_key.encrypt_entry_name(SecretBytes::from(name.as_bytes()))?;
+                    let enc_value = profile_key.encrypt_entry_value(
+                        &enc_category,
+                        &enc_name,
+                        SecretBytes::from(value),
+                    )?;
 
                     let mut enc_tags = Vec::new();
                     if let Some(tags) = tags {
                         for tag in tags {
                             match tag {
                                 EntryTag::Encrypted(tag_name, tag_value) => {
-                                    let enc_tag_name = profile_key.encrypt_tag_name(SecretBytes::from(tag_name.as_bytes()))?;
-                                    let enc_tag_value = profile_key.encrypt_tag_value(SecretBytes::from(tag_value.as_bytes()))?;
+                                    let enc_tag_name = profile_key
+                                        .encrypt_tag_name(SecretBytes::from(tag_name.as_bytes()))?;
+                                    let enc_tag_value = profile_key.encrypt_tag_value(
+                                        SecretBytes::from(tag_value.as_bytes()),
+                                    )?;
                                     enc_tags.push((false, enc_tag_name, enc_tag_value));
                                 }
                                 EntryTag::Plaintext(tag_name, tag_value) => {
-                                    enc_tags.push((true, tag_name.as_bytes().to_vec(), tag_value.as_bytes().to_vec()));
+                                    enc_tags.push((
+                                        true,
+                                        tag_name.as_bytes().to_vec(),
+                                        tag_value.as_bytes().to_vec(),
+                                    ));
                                 }
                             }
                         }
@@ -1116,20 +1253,28 @@ impl BackendSession for FlatFileSession {
 
                         self.pending_ops.push(Box::new(move || {
                             // Write file
-                            let mut file = File::create(&file_path_clone)
-                                .map_err(|e| err_msg!(Backend, "Failed to create entry file: {}", e))?;
-                            file.write_all(&encoded_clone)
-                                .map_err(|e| err_msg!(Backend, "Failed to write entry file: {}", e))?;
+                            let mut file = File::create(&file_path_clone).map_err(|e| {
+                                err_msg!(Backend, "Failed to create entry file: {}", e)
+                            })?;
+                            file.write_all(&encoded_clone).map_err(|e| {
+                                err_msg!(Backend, "Failed to write entry file: {}", e)
+                            })?;
 
                             // Update index
-                            let mut index = backend_clone.index.write()
-                                .map_err(|_| err_msg!(Backend, "Failed to acquire write lock on index"))?;
+                            let mut index = backend_clone.index.write().map_err(|_| {
+                                err_msg!(Backend, "Failed to acquire write lock on index")
+                            })?;
 
-                            let entries = index.get_mut(&profile_clone)
+                            let entries = index
+                                .get_mut(&profile_clone)
                                 .ok_or_else(|| err_msg!(NotFound, "Profile not found"))?;
 
                             // Remove old entry if exists
-                            entries.retain(|e| !(e.kind == kind && e.category == category_str && e.name == name_str));
+                            entries.retain(|e| {
+                                !(e.kind == kind
+                                    && e.category == category_str
+                                    && e.name == name_str)
+                            });
 
                             // Add new entry
                             entries.push(EntryIndex {
@@ -1150,14 +1295,18 @@ impl BackendSession for FlatFileSession {
                             .map_err(|e| err_msg!(Backend, "Failed to write entry file: {}", e))?;
 
                         // Update index
-                        let mut index = self.backend.index.write()
-                            .map_err(|_| err_msg!(Backend, "Failed to acquire write lock on index"))?;
+                        let mut index = self.backend.index.write().map_err(|_| {
+                            err_msg!(Backend, "Failed to acquire write lock on index")
+                        })?;
 
-                        let entries = index.get_mut(&self.profile)
+                        let entries = index
+                            .get_mut(&self.profile)
                             .ok_or_else(|| err_msg!(NotFound, "Profile not found"))?;
 
                         // Remove old entry if exists
-                        entries.retain(|e| !(e.kind == kind && e.category == category && e.name == name));
+                        entries.retain(|e| {
+                            !(e.kind == kind && e.category == category && e.name == name)
+                        });
 
                         // Add new entry
                         entries.push(EntryIndex {
@@ -1177,38 +1326,48 @@ impl BackendSession for FlatFileSession {
                         let name_str = name.to_string();
 
                         self.pending_ops.push(Box::new(move || {
-                            let mut index = backend_clone.index.write()
-                                .map_err(|_| err_msg!(Backend, "Failed to acquire write lock on index"))?;
+                            let mut index = backend_clone.index.write().map_err(|_| {
+                                err_msg!(Backend, "Failed to acquire write lock on index")
+                            })?;
 
-                            let entries = index.get_mut(&profile_clone)
+                            let entries = index
+                                .get_mut(&profile_clone)
                                 .ok_or_else(|| err_msg!(NotFound, "Profile not found"))?;
 
-                            if let Some(pos) = entries.iter().position(|e| e.kind == kind && e.category == category_str && e.name == name_str) {
+                            if let Some(pos) = entries.iter().position(|e| {
+                                e.kind == kind && e.category == category_str && e.name == name_str
+                            }) {
                                 let entry = entries.remove(pos);
                                 drop(index); // Release lock before I/O
 
                                 if entry.path.exists() {
-                                    fs::remove_file(&entry.path)
-                                        .map_err(|e| err_msg!(Backend, "Failed to remove entry file: {}", e))?;
+                                    fs::remove_file(&entry.path).map_err(|e| {
+                                        err_msg!(Backend, "Failed to remove entry file: {}", e)
+                                    })?;
                                 }
                             }
                             Ok(())
                         }));
                     } else {
                         // Execute immediately (non-transactional mode)
-                        let mut index = self.backend.index.write()
-                            .map_err(|_| err_msg!(Backend, "Failed to acquire write lock on index"))?;
+                        let mut index = self.backend.index.write().map_err(|_| {
+                            err_msg!(Backend, "Failed to acquire write lock on index")
+                        })?;
 
-                        let entries = index.get_mut(&self.profile)
+                        let entries = index
+                            .get_mut(&self.profile)
                             .ok_or_else(|| err_msg!(NotFound, "Profile not found"))?;
 
-                        if let Some(pos) = entries.iter().position(|e| e.kind == kind && e.category == category && e.name == name) {
+                        if let Some(pos) = entries.iter().position(|e| {
+                            e.kind == kind && e.category == category && e.name == name
+                        }) {
                             let entry = entries.remove(pos);
                             drop(index); // Release lock before I/O
 
                             if entry.path.exists() {
-                                fs::remove_file(&entry.path)
-                                    .map_err(|e| err_msg!(Backend, "Failed to remove entry file: {}", e))?;
+                                fs::remove_file(&entry.path).map_err(|e| {
+                                    err_msg!(Backend, "Failed to remove entry file: {}", e)
+                                })?;
                             }
                         }
                     }
@@ -1220,11 +1379,15 @@ impl BackendSession for FlatFileSession {
     }
 
     fn ping(&mut self) -> BoxFuture<'_, Result<(), Error>> {
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move {
+            refuse_freshness_deployment()?;
+            Ok(())
+        })
     }
 
     fn close(&mut self, commit: bool) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move {
+            refuse_freshness_deployment()?;
             if commit && self.transaction {
                 // Execute pending operations
                 for op in self.pending_ops.drain(..) {

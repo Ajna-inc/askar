@@ -133,6 +133,15 @@ impl IndySdkToAriesAskarMigration {
 
     /// Perform the migration
     pub async fn migrate(mut self) -> Result<(), Error> {
+        if std::env::var_os("ASKAR_FRESHNESS_LINEAGE").is_some()
+            || std::env::var_os("ASKAR_FRESHNESS_WITNESS_URL").is_some()
+        {
+            return Err(err_msg!(
+                Unsupported,
+                "Direct legacy migration is unavailable in a freshness-bound deployment"
+            ));
+        }
+
         if self.is_migrated().await? {
             self.close().await?;
             return Err(err_msg!(Backend, "Database is already migrated"));

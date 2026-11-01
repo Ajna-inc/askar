@@ -28,6 +28,9 @@ const DEFAULT_MAX_CONNECTIONS: u32 = 10;
 /// Configuration options for PostgreSQL stores
 #[derive(Debug)]
 pub struct PostgresStoreOptions {
+    pub(crate) expected_freshness: Option<uuid::Uuid>,
+    pub(crate) read_lease: Option<Duration>,
+    pub(crate) profile_lock: super::super::db_utils::ProfileLock,
     pub(crate) connect_timeout: Duration,
     pub(crate) idle_timeout: Duration,
     pub(crate) max_connections: u32,
@@ -41,12 +44,74 @@ pub struct PostgresStoreOptions {
 }
 
 impl PostgresStoreOptions {
+    /// `freshness_read_lease_ms` in the URI sets the read lease of this store's pinned
+    /// lineage for the process (see `freshness::default_read_lease`).
+    fn apply_read_lease(&self) -> Result<(), Error> {
+        if let Some(lease) = self.read_lease {
+            let lineage = match self.expected_freshness {
+                Some(lineage) => Some(lineage),
+                None => super::super::freshness::expected_lineage()?,
+            };
+            if let Some(lineage) = lineage {
+                super::super::freshness::set_read_lease(lineage, Some(lease));
+            }
+        }
+        Ok(())
+    }
+
+    async fn refuse_bound_destructive(&self) -> Result<(), Error> {
+        if self
+            .expected_freshness
+            .or(super::super::freshness::expected_lineage()?)
+            .is_some()
+        {
+            return Err(err_msg!(
+                Backend,
+                "Bound deployment refuses destructive store operations"
+            ));
+        }
+        let pool = match self.pool().await {
+            Ok(pool) => pool,
+            Err(SqlxError::Database(err))
+                if err.code() == Some(std::borrow::Cow::Borrowed("3D000")) =>
+            {
+                return Ok(())
+            }
+            Err(_) => {
+                return Err(err_msg!(
+                    Backend,
+                    "Cannot check store freshness before removal"
+                ))
+            }
+        };
+        let mut conn = pool.acquire().await?;
+        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='config'").fetch_one(conn.as_mut()).await?;
+        if exists > 0
+            && <Postgres as super::ExtDatabase>::freshness_head(&mut conn, false)
+                .await?
+                .is_some()
+        {
+            return Err(err_msg!(
+                Backend,
+                "Bound store refuses destructive operations"
+            ));
+        }
+        Ok(())
+    }
+
     /// Initialize `PostgresStoreOptions` from a generic set of options
     pub fn new<'a, O>(options: O) -> Result<Self, Error>
     where
         O: IntoOptions<'a>,
     {
         let mut opts = options.into_options()?;
+        let expected_freshness =
+            super::super::freshness::parse_lineage(opts.query.remove("freshness_lineage"))?;
+        let profile_lock =
+            super::super::db_utils::ProfileLock::parse(opts.query.remove("profile_lock"))?;
+        let read_lease = super::super::freshness::parse_read_lease(
+            opts.query.remove("freshness_read_lease_ms"),
+        )?;
         let connect_timeout = if let Some(timeout) = opts.query.remove("connect_timeout") {
             timeout
                 .parse()
@@ -105,6 +170,9 @@ impl PostgresStoreOptions {
         // admin user selects the default database
         opts.path = Cow::Borrowed("/postgres");
         Ok(Self {
+            expected_freshness,
+            read_lease,
+            profile_lock,
             connect_timeout: Duration::from_secs(connect_timeout),
             idle_timeout: Duration::from_secs(idle_timeout),
             max_connections,
@@ -190,6 +258,19 @@ impl PostgresStoreOptions {
         profile: Option<String>,
         recreate: bool,
     ) -> Result<PostgresBackend, Error> {
+        if self
+            .expected_freshness
+            .or(super::super::freshness::expected_lineage()?)
+            .is_some()
+        {
+            return Err(err_msg!(
+                Backend,
+                "Bound deployment refuses implicit provisioning"
+            ));
+        }
+        if recreate {
+            self.refuse_bound_destructive().await?;
+        }
         let conn_pool = self.create_db_pool().await?;
         let mut conn = conn_pool.acquire().await?;
         let mut txn = conn.begin().await?;
@@ -202,7 +283,7 @@ impl PostgresStoreOptions {
             let count = if let Some(schema) = self.schema.as_ref() {
                 sqlx::query_scalar::<_, i64>(
                     "SELECT COUNT(*) FROM information_schema.tables
-                        WHERE table_schema=?1 AND table_name='config'",
+                        WHERE table_schema=$1 AND table_name='config'",
                 )
                 .persistent(false)
                 .bind(schema)
@@ -228,8 +309,10 @@ impl PostgresStoreOptions {
                     profile,
                     self.host,
                     self.name,
+                    self.expected_freshness,
                 )
-                .await;
+                .await
+                .map(|backend| backend.with_profile_lock(self.profile_lock));
             }
         }
 
@@ -254,13 +337,11 @@ impl PostgresStoreOptions {
         let mut key_cache = KeyCache::new(store_key);
         key_cache.add_profile_mut(default_profile.clone(), profile_id, profile_key);
 
-        Ok(PostgresBackend::new(
-            conn_pool,
-            default_profile,
-            key_cache,
-            self.host,
-            self.name,
-        ))
+        Ok(
+            PostgresBackend::new(conn_pool, default_profile, key_cache, self.host, self.name)
+                .with_freshness_lineage(self.expected_freshness)
+                .with_profile_lock(self.profile_lock),
+        )
     }
 
     /// Open an existing Postgres store from this set of configuration options
@@ -270,6 +351,7 @@ impl PostgresStoreOptions {
         pass_key: PassKey<'_>,
         profile: Option<String>,
     ) -> Result<PostgresBackend, Error> {
+        self.apply_read_lease()?;
         let pool = match self.pool().await {
             Ok(p) => Ok(p),
             Err(SqlxError::Database(db_err)) if db_err.code() == Some(Cow::Borrowed("3D000")) => {
@@ -279,11 +361,22 @@ impl PostgresStoreOptions {
             }
             Err(err) => Err(err_msg!(Backend, "Error connecting to database pool").with_cause(err)),
         }?;
-        open_db(pool, method, pass_key, profile, self.host, self.name).await
+        open_db(
+            pool,
+            method,
+            pass_key,
+            profile,
+            self.host,
+            self.name,
+            self.expected_freshness,
+        )
+        .await
+        .map(|backend| backend.with_profile_lock(self.profile_lock))
     }
 
     /// Remove an existing Postgres store defined by these configuration options
     pub async fn remove(self) -> Result<bool, Error> {
+        self.refuse_bound_destructive().await?;
         let mut admin_conn = PgConnection::connect(self.admin_uri.as_ref())
             .await
             .map_err(err_map!(
@@ -439,8 +532,21 @@ pub(crate) async fn open_db(
     profile: Option<String>,
     host: String,
     name: String,
+    expected_freshness: Option<uuid::Uuid>,
 ) -> Result<PostgresBackend, Error> {
     let mut conn = conn_pool.acquire().await?;
+    // Opening never relies on a read lease: the witness is asked now. A head one behind the
+    // witness at open is another process's commit in flight or a stale clone; re-admission
+    // within the read budget settles which (see `ReadRetry`).
+    let mut retry = super::super::freshness::ReadRetry::new(false);
+    loop {
+        let head = <Postgres as super::ExtDatabase>::freshness_head(&mut conn, false).await?;
+        match super::super::freshness::check_fresh(head.as_ref(), expected_freshness).await {
+            Ok(()) => break,
+            Err(error) if retry.again(&error).await => continue,
+            Err(error) => return Err(error),
+        }
+    }
     let mut ver_ok = false;
     let mut default_profile: Option<String> = None;
     let mut store_key_ref: Option<String> = None;
@@ -502,9 +608,10 @@ pub(crate) async fn open_db(
 
     key_cache.add_profile_mut(profile.clone(), profile_id, profile_key);
 
-    Ok(PostgresBackend::new(
-        conn_pool, profile, key_cache, host, name,
-    ))
+    Ok(
+        PostgresBackend::new(conn_pool, profile, key_cache, host, name)
+            .with_freshness_lineage(expected_freshness),
+    )
 }
 
 /// Validate a postgres identifier.
